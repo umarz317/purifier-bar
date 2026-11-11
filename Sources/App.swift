@@ -119,6 +119,9 @@ final class Store {
             error = nil
             offline = false
             lastSeen = Date()
+            if UserDefaults.standard.object(forKey: "did") == nil, client.id != 0 {
+                UserDefaults.standard.set(Int(client.id), forKey: "did")
+            }
             // The custom Mi Home name only comes from cloud sign-in; otherwise name it by model.
             if name.isEmpty, let model = try? await Task.detached(operation: { try client.model() }).value {
                 name = MiIO.productName(model)
@@ -127,9 +130,31 @@ final class Store {
         } catch MiIOError.timeout {
             offline = true
             error = nil
+            await rediscover()
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    /// The router may hand the purifier a new IP after it reconnects. Find it again by device ID
+    /// (or, before the ID is known, by which device accepts our token).
+    private func rediscover() async {
+        let token = token, did = UserDefaults.standard.object(forKey: "did") as? Int
+        let match = await Task.detached { () -> (ip: String, client: MiIO, state: PurifierState)? in
+            for device in MiIO.discover() where did == nil || Int(device.did) == did {
+                guard let candidate = try? MiIO(host: device.ip, token: token),
+                      let state = try? candidate.readState() else { continue }
+                return (device.ip, candidate, state)
+            }
+            return nil
+        }.value
+        guard let match else { return }
+        host = match.ip
+        UserDefaults.standard.set(host, forKey: "host")
+        client = match.client
+        state = match.state
+        offline = false
+        lastSeen = Date()
     }
 
     func retry() async {

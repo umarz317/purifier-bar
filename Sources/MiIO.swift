@@ -43,6 +43,57 @@ final class MiIO: @unchecked Sendable {
         iv = md5(key + token)
     }
 
+    /// The device ID learned from the last handshake (0 until then).
+    var id: UInt32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return deviceID
+    }
+
+    /// Finds miIO devices by broadcasting a hello on each local IPv4 network.
+    /// (macOS only delivers subnet broadcasts like 192.168.1.255, not 255.255.255.255.)
+    static func discover(wait: TimeInterval = 2) -> [(ip: String, did: UInt32)] {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return [] }
+        defer { close(fd) }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let hello: [UInt8] = [0x21, 0x31, 0x00, 0x20] + [UInt8](repeating: 0xFF, count: 28)
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0 else { return [] }
+        defer { freeifaddrs(interfaces) }
+        for ptr in sequence(first: interfaces, next: { $0?.pointee.ifa_next }) {
+            guard let i = ptr?.pointee, let broadcast = i.ifa_dstaddr, i.ifa_addr?.pointee.sa_family == UInt8(AF_INET),
+                  i.ifa_flags & UInt32(IFF_UP | IFF_BROADCAST) == UInt32(IFF_UP | IFF_BROADCAST),
+                  i.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            var addr = UnsafeRawPointer(broadcast).load(as: sockaddr_in.self)
+            addr.sin_port = UInt16(54321).bigEndian
+            _ = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, hello, hello.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+
+        var found: [(ip: String, did: UInt32)] = []
+        let end = Date().addingTimeInterval(wait)
+        while Date() < end {
+            var buffer = [UInt8](repeating: 0, count: 64)
+            var from = sockaddr_in()
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let count = withUnsafeMutablePointer(to: &from) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buffer, buffer.count, 0, $0, &length) }
+            }
+            guard count >= 32 else { continue }
+            let ip = String(cString: inet_ntoa(from.sin_addr))
+            if !found.contains(where: { $0.ip == ip }) { found.append((ip, UInt32(bytes: buffer[8..<12]))) }
+        }
+        return found
+    }
+
     func call(_ method: String, _ params: Any) throws -> Any {
         lock.lock()
         defer { lock.unlock() }
