@@ -11,8 +11,8 @@ struct PurifierBarApp: App {
         } label: {
             // Keep the same views at all times; MenuBarExtra labels don't pick up views added later.
             HStack(spacing: 4) {
-                Image(systemName: "aqi.medium")
-                Text(store.state.map { "\($0.pm25)" } ?? "–")
+                Image(systemName: store.offline ? "wifi.slash" : "aqi.medium")
+                Text(store.offline ? "–" : store.state.map { "\($0.pm25)" } ?? "–")
             }
         }
         .menuBarExtraStyle(.window)
@@ -32,6 +32,9 @@ final class Store {
     var name = UserDefaults.standard.string(forKey: "name") ?? ""
     var state: PurifierState?
     var error: String?
+    var offline = false
+    var retrying = false
+    var lastSeen: Date?
     var setup = false
     var login = Login.idle
     private var client: MiIO?
@@ -45,7 +48,7 @@ final class Store {
         Task {
             while true {
                 await refresh()
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: .seconds(offline ? 10 : 30))
             }
         }
     }
@@ -114,14 +117,25 @@ final class Store {
         do {
             state = try await Task.detached { try client.readState() }.value
             error = nil
+            offline = false
+            lastSeen = Date()
             // The custom Mi Home name only comes from cloud sign-in; otherwise name it by model.
             if name.isEmpty, let model = try? await Task.detached(operation: { try client.model() }).value {
                 name = MiIO.productName(model)
                 UserDefaults.standard.set(name, forKey: "name")
             }
+        } catch MiIOError.timeout {
+            offline = true
+            error = nil
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    func retry() async {
+        retrying = true
+        await refresh()
+        retrying = false
     }
 
     func set(_ prop: Prop, _ value: some Sendable, apply: (inout PurifierState) -> Void) {
@@ -151,6 +165,8 @@ struct Panel: View {
         VStack(spacing: 16) {
             if store.setup {
                 SetupView(store: store)
+            } else if store.offline {
+                OfflineView(store: store)
             } else if let state = store.state {
                 Dashboard(store: store, state: state)
             } else if store.error == nil {
@@ -268,6 +284,34 @@ struct Dashboard: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+struct OfflineView: View {
+    let store: Store
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(store.name.isEmpty ? "Air Purifier" : store.name).font(.headline).lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ZStack {
+                Circle().stroke(Color.secondary.opacity(0.15), lineWidth: 12)
+                Image(systemName: "wifi.slash").font(.system(size: 40, weight: .medium)).foregroundStyle(.secondary)
+            }
+            .frame(width: 148, height: 148)
+            Text("Offline").font(.title3.weight(.semibold))
+            if let lastSeen = store.lastSeen {
+                Text("Last seen \(Text(lastSeen, style: .relative)) ago").font(.callout).foregroundStyle(.secondary)
+            }
+            Button { Task { await store.retry() } } label: {
+                Group {
+                    if store.retrying { ProgressView().controlSize(.small) } else { Text("Retry") }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent).controlSize(.large)
+            .disabled(store.retrying)
+        }
     }
 }
 
