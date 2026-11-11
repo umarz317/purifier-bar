@@ -292,10 +292,11 @@ struct AirRing: View {
     private var color: Color {
         guard active else { return .secondary }
         return switch pm25 {
-        case ..<13: .green
-        case ..<36: .yellow
-        case ..<56: .orange
-        case ..<151: .red
+        // Mi Home / China PM2.5 bands
+        case ..<35: .green
+        case ..<75: .yellow
+        case ..<115: .orange
+        case ..<150: .red
         default: .purple
         }
     }
