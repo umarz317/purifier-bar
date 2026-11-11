@@ -220,7 +220,8 @@ struct Panel: View {
                 Button("Settings", systemImage: "gearshape") { store.setup = true }
             }
             Spacer()
-            Button("Quit", systemImage: "power") { NSApplication.shared.terminate(nil) }
+            Button("Quit Purifier Bar", systemImage: "rectangle.portrait.and.arrow.right") { NSApplication.shared.terminate(nil) }
+                .help("Quit Purifier Bar")
         }
         .labelStyle(.iconOnly)
         .buttonStyle(.borderless)
