@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 @main
@@ -325,6 +326,7 @@ struct AirRing: View {
 
 struct SetupView: View {
     @Bindable var store: Store
+    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
         VStack(spacing: 14) {
@@ -344,6 +346,17 @@ struct SetupView: View {
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
+                Toggle("Open at login", isOn: $openAtLogin)
+                    .toggleStyle(.switch)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onChange(of: openAtLogin) { _, on in
+                        do {
+                            try on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+                        } catch {
+                            store.error = error.localizedDescription
+                            openAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
                 Button(action: store.signIn) {
                     Label("Change purifier", systemImage: "qrcode").frame(maxWidth: .infinity)
                 }

@@ -10,6 +10,7 @@
 
 - Live PM2.5 in the menu bar
 - Power, Auto / Sleep / Manual, fan level, display, beep, child lock, filter life
+- Open at login
 - Sign in by scanning a QR code with Mi Home. No password needed.
 - Talks to the purifier directly on your Wi-Fi. The cloud is only used once, to find its token.
 
