@@ -148,6 +148,15 @@ final class XiaomiCloud {
 
     // MARK: - Remote control (used when the purifier isn't reachable on the local network)
 
+    /// Whether Xiaomi's cloud currently sees the device. `prop/get` keeps returning the last
+    /// known values after a device drops off, so this is the only reliable offline signal.
+    func isOnline(did: String, server: String) async throws -> Bool? {
+        let json = try await call(server, "/home/device_list", #"{"getVirtualModel":false,"getHuamiDevices":0}"#)
+        let list = (json["result"] as? [String: Any])?["list"] as? [[String: Any]] ?? []
+        guard let device = list.first(where: { "\($0["did"] ?? "")" == did }) else { return nil }
+        return device["isOnline"] as? Bool
+    }
+
     func readState(did: String, server: String) async throws -> PurifierState {
         let params = Prop.allCases.map { ["did": did, "siid": $0.ids.siid, "piid": $0.ids.piid] as [String: Any] }
         let json = try await call(server, "/miotspec/prop/get", try Self.compact(["params": params]))

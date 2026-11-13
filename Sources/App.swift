@@ -194,7 +194,18 @@ final class Store {
         guard let remote else { return false }
         let generation = writeGeneration
         do {
-            let reading = try await XiaomiCloud(session: remote.session).readState(did: remote.did, server: remote.server)
+            let cloud = XiaomiCloud(session: remote.session)
+            var online: Bool?
+            do {
+                online = try await cloud.isOnline(did: remote.did, server: remote.server)
+            } catch CloudError.expired {
+                throw CloudError.expired
+            } catch {
+                log.error("Cloud online check failed: \(String(describing: error), privacy: .public)")  // fall back to the reading
+            }
+            log.notice("Cloud says online: \(String(describing: online), privacy: .public)")
+            if online == false { return false }
+            let reading = try await cloud.readState(did: remote.did, server: remote.server)
             guard generation == writeGeneration else { return true }
             state = reading
             offline = false
