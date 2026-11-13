@@ -221,26 +221,32 @@ struct PurifierState: Equatable {
     var brightness = 2
 }
 
+extension PurifierState {
+    /// Parses get_properties rows (local miIO or Xiaomi cloud), matched by siid/piid.
+    init?(rows: [[String: Any]]) {
+        var values: [Prop: Any] = [:]
+        for row in rows where row["code"] as? Int == 0 {
+            if let siid = row["siid"] as? Int, let piid = row["piid"] as? Int,
+               let prop = Prop.allCases.first(where: { $0.ids == (siid, piid) }) { values[prop] = row["value"] }
+        }
+        guard values[.pm25] != nil else { return nil }
+        self.init()
+        power = values[.power] as? Bool ?? false
+        mode = values[.mode] as? Int ?? 0
+        pm25 = values[.pm25] as? Int ?? 0
+        filterLife = values[.filterLife] as? Int ?? 0
+        favoriteLevel = values[.favoriteLevel] as? Int ?? 0
+        buzzer = values[.buzzer] as? Bool ?? false
+        childLock = values[.childLock] as? Bool ?? false
+        brightness = values[.brightness] as? Int ?? 2
+    }
+}
+
 extension MiIO {
     func readState() throws -> PurifierState {
         let params = Prop.allCases.map { ["did": $0.rawValue, "siid": $0.ids.siid, "piid": $0.ids.piid] }
-        guard let rows = try call("get_properties", params) as? [[String: Any]] else {
-            throw MiIOError.badResponse
-        }
-        var values: [Prop: Any] = [:]
-        for row in rows where row["code"] as? Int == 0 {
-            if let name = row["did"] as? String, let prop = Prop(rawValue: name) { values[prop] = row["value"] }
-        }
-        guard values[.pm25] != nil else { throw MiIOError.badResponse }
-        var state = PurifierState()
-        state.power = values[.power] as? Bool ?? false
-        state.mode = values[.mode] as? Int ?? 0
-        state.pm25 = values[.pm25] as? Int ?? 0
-        state.filterLife = values[.filterLife] as? Int ?? 0
-        state.favoriteLevel = values[.favoriteLevel] as? Int ?? 0
-        state.buzzer = values[.buzzer] as? Bool ?? false
-        state.childLock = values[.childLock] as? Bool ?? false
-        state.brightness = values[.brightness] as? Int ?? 2
+        guard let rows = try call("get_properties", params) as? [[String: Any]],
+              let state = PurifierState(rows: rows) else { throw MiIOError.badResponse }
         return state
     }
 

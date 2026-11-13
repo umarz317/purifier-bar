@@ -9,11 +9,17 @@ struct CloudDevice: Identifiable, Hashable {
     let model: String
     let ip: String
     let token: String
+    let server: String
 }
 
 enum CloudError: LocalizedError {
-    case failed(String)
-    var errorDescription: String? { if case .failed(let message) = self { message } else { nil } }
+    case failed(String), expired
+    var errorDescription: String? {
+        switch self {
+        case .failed(let message): message
+        case .expired: "Mi Home sign-in expired. Sign in again in Settings for remote access."
+        }
+    }
 }
 
 /// Xiaomi account QR login + device list, ported from
@@ -33,16 +39,32 @@ final class XiaomiCloud {
     /// Models sharing the 4 Compact's property map (checked against miot-spec.org).
     static let supportedModels: Set = ["zhimi.airp.cpa4", "xiaomi.airp.cpa4", "zhimi.airp.rmb1"]
 
-    private let session: URLSession
+    private let http: URLSession
     private let agent: String
+    /// What's needed to call the API later without scanning again. Kept in the Keychain.
+    struct Session: Codable {
+        var userId: String
+        var ssecurity: String
+        var serviceToken: String
+    }
+
     private var userId = ""
     private var ssecurity = ""
     private var serviceToken = ""
 
+    var session: Session { Session(userId: userId, ssecurity: ssecurity, serviceToken: serviceToken) }
+
+    convenience init(session: Session) {
+        self.init()
+        userId = session.userId
+        ssecurity = session.ssecurity
+        serviceToken = session.serviceToken
+    }
+
     init() {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .always
-        session = URLSession(configuration: config)
+        http = URLSession(configuration: config)
         let letters = String((0..<18).map { _ in Character(UnicodeScalar(UInt8.random(in: 97...122))) })
         let id = String((0..<13).map { _ in Character(UnicodeScalar(UInt8.random(in: 65...69))) })
         agent = "\(letters)-\(id) APP/com.xiaomi.mihome APPV/10.5.201"
@@ -63,7 +85,7 @@ final class XiaomiCloud {
         let json = try await getJSON(URLRequest(url: url.url!))
         guard let qr = (json["qr"] as? String).flatMap(URL.init), let poll = (json["lp"] as? String).flatMap(URL.init)
         else { throw CloudError.failed("Couldn't start Mi Home sign-in") }
-        let (data, _) = try await session.data(from: qr)
+        let (data, _) = try await http.data(from: qr)
         guard let image = NSImage(data: data) else { throw CloudError.failed("Couldn't load the QR code") }
         let timeout = (json["timeout"] as? Double) ?? 300
         return QRCode(image: image, poll: poll, expires: Date().addingTimeInterval(timeout))
@@ -88,8 +110,8 @@ final class XiaomiCloud {
         else { throw CloudError.failed("Mi Home sign-in failed") }
         userId = "\(user)"
         self.ssecurity = ssecurity
-        _ = try await session.data(from: location)
-        guard let token = session.configuration.httpCookieStorage?.cookies?.first(where: { $0.name == "serviceToken" })
+        _ = try await http.data(from: location)
+        guard let token = http.configuration.httpCookieStorage?.cookies?.first(where: { $0.name == "serviceToken" })
         else { throw CloudError.failed("Mi Home sign-in failed") }
         serviceToken = token.value
     }
@@ -119,7 +141,7 @@ final class XiaomiCloud {
                           let token = device["token"] as? String, !token.isEmpty else { continue }
                     found.append(CloudDevice(
                         id: "\(device["did"] ?? model)", name: device["name"] as? String ?? "Air Purifier",
-                        model: model, ip: device["localip"] as? String ?? "", token: token))
+                        model: model, ip: device["localip"] as? String ?? "", token: token, server: server))
                 }
             }
             if !found.isEmpty { return found }
@@ -127,10 +149,32 @@ final class XiaomiCloud {
         return []
     }
 
+    // MARK: - Remote control (used when the purifier isn't reachable on the local network)
+
+    func readState(did: String, server: String) async throws -> PurifierState {
+        let params = Prop.allCases.map { ["did": did, "siid": $0.ids.siid, "piid": $0.ids.piid] as [String: Any] }
+        let json = try await call(server, "/miotspec/prop/get", try Self.compact(["params": params]))
+        guard let rows = json["result"] as? [[String: Any]], let state = PurifierState(rows: rows) else {
+            throw CloudError.failed("Purifier is offline")
+        }
+        return state
+    }
+
+    func set(_ prop: Prop, _ value: Any, did: String, server: String) async throws {
+        let params = [["did": did, "siid": prop.ids.siid, "piid": prop.ids.piid, "value": value] as [String: Any]]
+        let json = try await call(server, "/miotspec/prop/set", try Self.compact(["params": params]))
+        let code = ((json["result"] as? [[String: Any]])?.first?["code"] as? Int) ?? (json["code"] as? Int) ?? -1
+        guard code == 0 else { throw CloudError.failed("Purifier rejected change (code \(code))") }
+    }
+
+    private static func compact(_ object: Any) throws -> String {
+        String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+    }
+
     // MARK: - Networking
 
     private func getJSON(_ request: URLRequest) async throws -> [String: Any] {
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await http.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw CloudError.failed("Mi Home sign-in failed") }
         let text = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "&&&START&&&", with: "")
         guard let json = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
@@ -156,11 +200,18 @@ final class XiaomiCloud {
             "userId=\(userId); yetAnotherServiceToken=\(serviceToken); serviceToken=\(serviceToken); "
                 + "locale=en_GB; timezone=GMT+02:00; is_daylight=1; dst_offset=3600000; channel=MI_APP_STORE",
             forHTTPHeaderField: "Cookie")
-        let (body, response) = try await session.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200,
-              let plain = Self.decrypt(String(decoding: body, as: UTF8.self), nonce: nonce, ssecurity: ssecurity),
-              let json = try JSONSerialization.jsonObject(with: plain) as? [String: Any]
-        else { throw CloudError.failed("Unexpected reply from Xiaomi") }
+        let (body, response) = try await http.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        // Auth failures come back as plain JSON (or 401/403) instead of an encrypted body.
+        let plain = Self.decrypt(String(decoding: body, as: UTF8.self), nonce: nonce, ssecurity: ssecurity)
+        let json = plain.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            ?? (try? JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let message = "\(json?["message"] ?? "")".lowercased()
+        if status == 401 || status == 403 || [2, 3].contains(json?["code"] as? Int ?? 0) || message.contains("auth err")
+            || message.contains("invalid signature") || message.contains("servicetoken_expired") {
+            throw CloudError.expired
+        }
+        guard status == 200, let json else { throw CloudError.failed("Unexpected reply from Xiaomi") }
         return json
     }
 

@@ -1,5 +1,8 @@
+import OSLog
 import ServiceManagement
 import SwiftUI
+
+private let log = Logger(subsystem: "local.airbar", category: "purifier")
 
 @main
 struct PurifierBarApp: App {
@@ -37,8 +40,22 @@ final class Store {
     var lastSeen: Date?
     var setup = false
     var login = Login.idle
+    /// Mi Home sign-in for reaching the purifier through Xiaomi's cloud when it's not on this network.
+    var remote = Keychain.load(Remote.self)
+    /// The last reading came through the cloud rather than the local network.
+    var viaCloud = false
     private var client: MiIO?
     private var loginTask: Task<Void, Never>?
+    private var pendingSession: XiaomiCloud.Session?
+    /// Bumped on every change the user makes; readings that started before a change are dropped,
+    /// so a slow in-flight read can't flip the UI back to the old value.
+    private var writeGeneration = 0
+
+    struct Remote: Codable {
+        var session: XiaomiCloud.Session
+        var did: String
+        var server: String
+    }
 
     var connected: Bool { client != nil }
 
@@ -63,6 +80,7 @@ final class Store {
                 let qr = try await cloud.startLogin()
                 login = .qr(qr.image)
                 try await cloud.waitForScan(qr)
+                pendingSession = cloud.session
                 login = .searching
                 let devices = try await cloud.purifiers()
                 switch devices.count {
@@ -90,6 +108,11 @@ final class Store {
             login = .idle
             return
         }
+        if let session = pendingSession {
+            remote = Remote(session: session, did: device.id, server: device.server)
+            Keychain.save(remote)
+        }
+        UserDefaults.standard.removeObject(forKey: "did")
         host = device.ip
         token = device.token
         name = device.name
@@ -114,10 +137,14 @@ final class Store {
 
     func refresh() async {
         guard let client else { return }
+        let generation = writeGeneration
         do {
-            state = try await Task.detached { try client.readState() }.value
+            let reading = try await Task.detached { try client.readState() }.value
+            guard generation == writeGeneration else { return }
+            state = reading
             error = nil
             offline = false
+            viaCloud = false
             lastSeen = Date()
             if UserDefaults.standard.object(forKey: "did") == nil, client.id != 0 {
                 UserDefaults.standard.set(Int(client.id), forKey: "did")
@@ -128,9 +155,11 @@ final class Store {
                 UserDefaults.standard.set(name, forKey: "name")
             }
         } catch MiIOError.timeout {
-            offline = true
+            log.notice("Local read timed out")
             error = nil
-            await rediscover()
+            if await rediscover() { return }
+            if await refreshViaCloud() { return }
+            offline = true
         } catch {
             self.error = error.localizedDescription
         }
@@ -138,7 +167,7 @@ final class Store {
 
     /// The router may hand the purifier a new IP after it reconnects. Find it again by device ID
     /// (or, before the ID is known, by which device accepts our token).
-    private func rediscover() async {
+    private func rediscover() async -> Bool {
         let token = token, did = UserDefaults.standard.object(forKey: "did") as? Int
         let match = await Task.detached { () -> (ip: String, client: MiIO, state: PurifierState)? in
             for device in MiIO.discover() where did == nil || Int(device.did) == did {
@@ -148,13 +177,39 @@ final class Store {
             }
             return nil
         }.value
-        guard let match else { return }
+        guard let match else { return false }
         host = match.ip
         UserDefaults.standard.set(host, forKey: "host")
         client = match.client
         state = match.state
         offline = false
+        viaCloud = false
         lastSeen = Date()
+        return true
+    }
+
+    private func refreshViaCloud() async -> Bool {
+        guard let remote else { return false }
+        let generation = writeGeneration
+        do {
+            let reading = try await XiaomiCloud(session: remote.session).readState(did: remote.did, server: remote.server)
+            guard generation == writeGeneration else { return true }
+            state = reading
+            offline = false
+            viaCloud = true
+            lastSeen = Date()
+            return true
+        } catch CloudError.expired {
+            signOutRemote()
+        } catch {}
+        return false
+    }
+
+    private func signOutRemote() {
+        remote = nil
+        viaCloud = false
+        Keychain.delete()
+        error = CloudError.expired.localizedDescription
     }
 
     func retry() async {
@@ -167,14 +222,34 @@ final class Store {
         guard let client, var next = state else { return }
         apply(&next)
         state = next  // optimistic; the refresh below corrects it if the purifier disagrees
+        writeGeneration += 1
         Task {
+            var failure: String?
+            var usedCloud = false
             do {
-                try await Task.detached { try client.set(prop, value) }.value
-                error = nil
+                if viaCloud, let remote {
+                    usedCloud = true
+                    try await XiaomiCloud(session: remote.session).set(prop, value, did: remote.did, server: remote.server)
+                } else {
+                    do {
+                        try await Task.detached { try client.set(prop, value) }.value
+                    } catch MiIOError.timeout where remote != nil {
+                        let remote = remote!
+                        usedCloud = true
+                        try await XiaomiCloud(session: remote.session).set(prop, value, did: remote.did, server: remote.server)
+                    }
+                }
+                log.notice("Set \(prop.rawValue, privacy: .public) to \(String(describing: value), privacy: .public) (\(usedCloud ? "cloud" : "local", privacy: .public))")
+            } catch CloudError.expired {
+                signOutRemote()
             } catch {
-                self.error = error.localizedDescription
+                failure = error.localizedDescription
+                log.error("Set \(prop.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             }
+            // The cloud reports the old value for a moment after a change.
+            if usedCloud { try? await Task.sleep(for: .seconds(2)) }
             await refresh()
+            if let failure { self.error = failure }  // after refresh, which would otherwise clear it
         }
     }
 }
@@ -239,6 +314,9 @@ struct Dashboard: View {
         VStack(spacing: 16) {
             HStack {
                 Text(store.name.isEmpty ? "Air Purifier" : store.name).font(.headline).lineLimit(1)
+                if store.viaCloud {
+                    Image(systemName: "icloud").foregroundStyle(.secondary).help("Away from home: via Xiaomi cloud")
+                }
                 Spacer()
                 Button { store.set(.power, !state.power) { $0.power.toggle() } } label: {
                     Image(systemName: "power")
@@ -413,6 +491,9 @@ struct SetupView: View {
                         Text(store.host).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
+                    if store.remote != nil {
+                        Image(systemName: "icloud").foregroundStyle(.secondary).help("Remote access on")
+                    }
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
@@ -428,7 +509,8 @@ struct SetupView: View {
                         }
                     }
                 Button(action: store.signIn) {
-                    Label("Change purifier", systemImage: "qrcode").frame(maxWidth: .infinity)
+                    Label(store.remote == nil ? "Turn on remote access" : "Change purifier", systemImage: "qrcode")
+                        .frame(maxWidth: .infinity)
                 }
                 .controlSize(.large)
                 Button("Enter IP and token") { store.login = .manual }
