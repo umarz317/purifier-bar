@@ -127,6 +127,8 @@ final class Store {
             }
             state = nil
             error = nil
+            offline = false  // show a spinner, not a stale Offline, until the first reading
+            viaCloud = false
             setup = false
             login = .idle
             Task { await refresh() }
