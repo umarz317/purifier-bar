@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import CryptoKit
 import Foundation
 
@@ -93,19 +94,15 @@ final class XiaomiCloud {
 
     /// Long-polls until the QR code is scanned and approved in Mi Home.
     func waitForScan(_ qr: QRCode) async throws {
-        var login: [String: Any]?
-        while login == nil {
-            try Task.checkCancellation()
-            guard Date() < qr.expires else { throw CloudError.failed("QR code expired") }
-            do {
-                login = try await getJSON(URLRequest(url: qr.poll, timeoutInterval: 10))
-            } catch let error as URLError where error.code == .timedOut {
-                continue
-            } catch is CloudError {
-                try await Task.sleep(for: .seconds(1))
-            }
+        // Xiaomi holds this request open until the code is scanned. Dropping it early makes
+        // every retry fail with 403, so wait once for the code's whole lifetime.
+        let login: [String: Any]
+        do {
+            login = try await getJSON(URLRequest(url: qr.poll, timeoutInterval: max(10, qr.expires.timeIntervalSinceNow)))
+        } catch let error as URLError where error.code == .timedOut {
+            throw CloudError.failed("QR code expired")
         }
-        guard let login, let ssecurity = login["ssecurity"] as? String,
+        guard let ssecurity = login["ssecurity"] as? String,
               let location = (login["location"] as? String).flatMap(URL.init), let user = login["userId"]
         else { throw CloudError.failed("Mi Home sign-in failed") }
         userId = "\(user)"
@@ -155,6 +152,7 @@ final class XiaomiCloud {
         let params = Prop.allCases.map { ["did": did, "siid": $0.ids.siid, "piid": $0.ids.piid] as [String: Any] }
         let json = try await call(server, "/miotspec/prop/get", try Self.compact(["params": params]))
         guard let rows = json["result"] as? [[String: Any]], let state = PurifierState(rows: rows) else {
+            Logger(subsystem: "local.airbar", category: "cloud").error("prop/get reply: \(String(describing: json).prefix(600), privacy: .public)")
             throw CloudError.failed("Purifier is offline")
         }
         return state

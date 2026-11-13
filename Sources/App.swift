@@ -200,8 +200,11 @@ final class Store {
             lastSeen = Date()
             return true
         } catch CloudError.expired {
+            log.error("Cloud sign-in expired")
             signOutRemote()
-        } catch {}
+        } catch {
+            log.error("Cloud read failed: \(String(describing: error), privacy: .public)")
+        }
         return false
     }
 
@@ -415,6 +418,15 @@ struct OfflineView: View {
             }
             .buttonStyle(.borderedProminent).controlSize(.large)
             .disabled(store.retrying)
+            if store.remote == nil {
+                Button {
+                    store.setup = true
+                    store.signIn()
+                } label: {
+                    Label("Turn on remote access", systemImage: "icloud").frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+            }
         }
     }
 }
